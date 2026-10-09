@@ -1,9 +1,68 @@
+
 const mongoose = require("mongoose");
 
 const Payment = require("../models/Payment");
 const Bill = require("../models/Bill");
 const Customer = require("../models/Customer");
+const DeliveryAgent = require("../models/DeliveryAgent");
+const User = require("../models/User");
 
+// =====================================================
+// HELPERS
+// =====================================================
+
+const getActor = async (req) => {
+  const userId = req.user?.userId;
+
+  if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+    return null;
+  }
+
+  const user = await User.findById(userId);
+
+  if (!user || !user.isActive) {
+    return null;
+  }
+
+  if (user.userType === "agent") {
+    const agent = await DeliveryAgent.findOne({
+      userId: user._id,
+      status: "active",
+    });
+
+    if (!agent) return null;
+
+    return {
+      type: "delivery_agent",
+      userId: user._id,
+      agentId: agent._id,
+      vendorId: agent.vendorId,
+      name: agent.name,
+    };
+  }
+
+  // Adapt this check if your User model uses another vendor role.
+  if (user.userType === "vendor") {
+    return {
+      type: "vendor",
+      userId: user._id,
+      vendorId: user._id,
+      agentId: null,
+      name: user.name || "",
+    };
+  }
+
+  return null;
+};
+
+const roundMoney = (value) =>
+  Number(Number(value).toFixed(2));
+
+const getBillStatus = (paid, total) => {
+  if (paid >= total) return "paid";
+  if (paid > 0) return "partially_paid";
+  return "unpaid";
+};
 
 // =====================================================
 // ADD PAYMENT
@@ -11,7 +70,14 @@ const Customer = require("../models/Customer");
 
 const addPayment = async (req, res) => {
   try {
-    const vendorId = req.user.userId;
+    const actor = await getActor(req);
+
+    if (!actor) {
+      return res.status(403).json({
+        success: false,
+        message: "Authorized vendor or active delivery agent required",
+      });
+    }
 
     const {
       customerId,
@@ -21,204 +87,300 @@ const addPayment = async (req, res) => {
       paymentMethod,
       referenceNumber,
       notes,
+      idempotencyKey,
     } = req.body;
 
-    // ---------------------------------------------
-    // Validate required fields
-    // ---------------------------------------------
-
-    if (!customerId) {
+    if (!customerId || !billId || amount === undefined) {
       return res.status(400).json({
         success: false,
-        message: "customerId is required",
+        message: "customerId, billId and amount are required",
       });
     }
 
-    if (!billId) {
+    if (
+      !mongoose.Types.ObjectId.isValid(customerId) ||
+      !mongoose.Types.ObjectId.isValid(billId)
+    ) {
       return res.status(400).json({
         success: false,
-        message: "billId is required",
+        message: "Invalid customerId or billId",
       });
     }
 
-    if (!amount || Number(amount) <= 0) {
+    const paymentAmount = Number(amount);
+
+    if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
       return res.status(400).json({
         success: false,
-        message: "Valid payment amount is required",
+        message: "Payment amount must be greater than zero",
       });
     }
 
-    if (!paymentMethod) {
+    if (paymentMethod !== "cash") {
       return res.status(400).json({
         success: false,
-        message: "paymentMethod is required",
+        message: "Currently only cash payments are enabled",
       });
     }
 
-    // ---------------------------------------------
-    // Validate ObjectIds
-    // ---------------------------------------------
-
-    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+    if (
+      paymentDate &&
+      Number.isNaN(new Date(paymentDate).getTime())
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Invalid customerId",
+        message: "Invalid paymentDate",
       });
     }
 
-    if (!mongoose.Types.ObjectId.isValid(billId)) {
+    if (
+      typeof idempotencyKey !== "string" ||
+      !idempotencyKey.trim() ||
+      idempotencyKey.length > 128
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Invalid billId",
+        message: "A unique idempotencyKey is required",
       });
     }
 
-    // ---------------------------------------------
-    // Validate payment method
-    // ---------------------------------------------
-
-    const allowedPaymentMethods = [
-      "cash",
-      "upi",
-      "bank_transfer",
-      "other",
-    ];
-
-    if (!allowedPaymentMethods.includes(paymentMethod)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid paymentMethod. Use cash, upi, bank_transfer or other",
-      });
-    }
-
-    // ---------------------------------------------
-    // Check customer
-    // ---------------------------------------------
-
+    // Customer must belong to the actor's vendor.
     const customer = await Customer.findOne({
       _id: customerId,
-      vendorId,
+      vendorId: actor.vendorId,
     });
 
     if (!customer) {
       return res.status(404).json({
         success: false,
-        message: "Customer not found",
+        message: "Customer not found for this vendor",
       });
     }
 
-    // ---------------------------------------------
-    // Check bill
-    // ---------------------------------------------
+    // An agent can collect payments only for assigned customers.
+    if (actor.type === "delivery_agent") {
+      if (
+        !customer.deliveryAgentId ||
+        customer.deliveryAgentId.toString() !==
+          actor.agentId.toString()
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "This customer is not assigned to you",
+        });
+      }
+    }
 
+    // Check bill ownership.
     const bill = await Bill.findOne({
       _id: billId,
-      vendorId,
+      vendorId: actor.vendorId,
       customerId,
     });
 
     if (!bill) {
       return res.status(404).json({
         success: false,
-        message:
-          "Bill not found or does not belong to this customer",
+        message: "Bill not found for this customer",
       });
     }
 
-    // ---------------------------------------------
-    // Validate amount
-    // ---------------------------------------------
-
-    const paymentAmount = Number(
-      Number(amount).toFixed(2)
-    );
-
-    // Don't allow payment greater than outstanding
-    if (paymentAmount > bill.outstandingAmount) {
-      return res.status(400).json({
-        success: false,
-        message: "Payment amount cannot exceed outstanding amount",
-        outstandingAmount: bill.outstandingAmount,
-      });
-    }
-
-    // ---------------------------------------------
-    // Create payment
-    // ---------------------------------------------
-
-    const payment = await Payment.create({
-      vendorId,
-      customerId,
-      billId,
-      amount: paymentAmount,
-      paymentDate: paymentDate || new Date(),
-      paymentMethod,
-      referenceNumber: referenceNumber || "",
-      notes: notes || "",
+    // Idempotency: return the existing payment for a retry.
+    const existingPayment = await Payment.findOne({
+      vendorId: actor.vendorId,
+      idempotencyKey: idempotencyKey.trim(),
     });
 
-    // ---------------------------------------------
-    // Update bill
-    // ---------------------------------------------
+    if (existingPayment) {
+      if (
+        existingPayment.billId.toString() !== billId ||
+        existingPayment.customerId.toString() !== customerId ||
+        roundMoney(existingPayment.amount) !== roundMoney(paymentAmount)
+      ) {
+        return res.status(409).json({
+          success: false,
+          message: "Idempotency key was already used for another payment",
+        });
+      }
 
-    bill.paidAmount = Number(
-      (
-        bill.paidAmount + paymentAmount
-      ).toFixed(2)
-    );
-
-    bill.outstandingAmount = Math.max(
-      Number(
-        (
-          bill.totalAmount - bill.paidAmount
-        ).toFixed(2)
-      ),
-      0
-    );
-
-    // ---------------------------------------------
-    // Update bill status
-    // ---------------------------------------------
-
-    if (bill.paidAmount >= bill.totalAmount) {
-      bill.status = "paid";
-    } else if (bill.paidAmount > 0) {
-      bill.status = "partially_paid";
-    } else {
-      bill.status = "unpaid";
+      return res.status(200).json({
+        success: true,
+        duplicate: true,
+        message: "Payment was already recorded",
+        payment: existingPayment,
+      });
     }
 
-    await bill.save();
+    const amountToPay = roundMoney(paymentAmount);
+    const currentOutstanding = roundMoney(bill.outstandingAmount);
+
+    if (amountToPay > currentOutstanding) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment exceeds the bill's outstanding amount",
+        outstandingAmount: currentOutstanding,
+      });
+    }
+
+    const receiptNumber =
+      `MB-${Date.now()}-${new mongoose.Types.ObjectId()
+        .toString()
+        .slice(-6)
+        .toUpperCase()}`;
+
+    // Conditional update prevents two concurrent requests from
+    // successfully collecting more than the outstanding amount.
+    const updatedBill = await Bill.findOneAndUpdate(
+      {
+        _id: bill._id,
+        vendorId: actor.vendorId,
+        customerId,
+        outstandingAmount: { $gte: amountToPay },
+      },
+      [
+        {
+          $set: {
+            paidAmount: {
+              $round: [
+                { $add: ["$paidAmount", amountToPay] },
+                2,
+              ],
+            },
+            outstandingAmount: {
+              $round: [
+                {
+                  $max: [
+                    { $subtract: ["$outstandingAmount", amountToPay] },
+                    0,
+                  ],
+                },
+                2,
+              ],
+            },
+          },
+        },
+        {
+          $set: {
+            status: {
+              $cond: [
+                { $eq: ["$outstandingAmount", 0] },
+                "paid",
+                {
+                  $cond: [
+                    { $gt: ["$paidAmount", 0] },
+                    "partially_paid",
+                    "unpaid",
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      ],
+      { new: true }
+    );
+
+    if (!updatedBill) {
+      return res.status(409).json({
+        success: false,
+        message: "Bill balance changed. Refresh and try again.",
+      });
+    }
+
+    let payment;
+
+    try {
+      payment = await Payment.create({
+        vendorId: actor.vendorId,
+        customerId,
+        billId,
+        amount: amountToPay,
+        paymentDate: paymentDate || new Date(),
+        paymentMethod: "cash",
+        referenceNumber: referenceNumber || "",
+        notes: notes || "",
+        collectorType: actor.type,
+        deliveryAgentId: actor.agentId,
+        collectorName: actor.name,
+        collectedByUserId: actor.userId,
+        receiptNumber,
+        idempotencyKey: idempotencyKey.trim(),
+        whatsappStatus: "not_configured",
+      });
+    } catch (error) {
+      // Restore the bill balance if payment insertion fails.
+      await Bill.updateOne(
+        {
+          _id: updatedBill._id,
+          vendorId: actor.vendorId,
+        },
+        {
+          $inc: {
+            paidAmount: -amountToPay,
+            outstandingAmount: amountToPay,
+          },
+          $set: {
+            status: getBillStatus(
+              roundMoney(updatedBill.paidAmount - amountToPay),
+              updatedBill.totalAmount
+            ),
+          },
+        }
+      );
+
+      if (error.code === 11000) {
+        const duplicate = await Payment.findOne({
+          vendorId: actor.vendorId,
+          idempotencyKey: idempotencyKey.trim(),
+        });
+
+        if (duplicate) {
+          return res.status(200).json({
+            success: true,
+            duplicate: true,
+            message: "Payment was already recorded",
+            payment: duplicate,
+          });
+        }
+      }
+
+      throw error;
+    }
 
     return res.status(201).json({
       success: true,
-      message: "Payment added successfully",
-
+      message: "Payment recorded successfully",
       payment,
-
+      receipt: {
+        receiptNumber: payment.receiptNumber,
+        customerName: customer.name,
+        customerPhone: customer.phone,
+        billAmount: bill.totalAmount,
+        paymentAmount: payment.amount,
+        paymentMethod: payment.paymentMethod,
+        paymentDate: payment.paymentDate,
+        collectorType: payment.collectorType,
+        collectorName: payment.collectorName,
+        remainingAmount: updatedBill.outstandingAmount,
+        billStatus: updatedBill.status,
+      },
       bill: {
-        id: bill._id,
-        totalAmount: bill.totalAmount,
-        paidAmount: bill.paidAmount,
-        outstandingAmount: bill.outstandingAmount,
-        status: bill.status,
+        id: updatedBill._id,
+        totalAmount: updatedBill.totalAmount,
+        paidAmount: updatedBill.paidAmount,
+        outstandingAmount: updatedBill.outstandingAmount,
+        status: updatedBill.status,
       },
     });
-
   } catch (error) {
-    console.error(
-      "Add payment error:",
-      error
-    );
+    console.error("Add payment error:", error);
 
     return res.status(500).json({
       success: false,
-      message: "Failed to add payment",
+      message: "Failed to record payment",
     });
   }
 };
-
 
 // =====================================================
 // GET PAYMENTS FOR BILL
@@ -226,7 +388,14 @@ const addPayment = async (req, res) => {
 
 const getBillPayments = async (req, res) => {
   try {
-    const vendorId = req.user.userId;
+    const actor = await getActor(req);
+    if (!actor) {
+      return res.status(403).json({
+        success: false,
+        message: "Authorized user required",
+      });
+    }
+
     const { billId } = req.params;
 
     if (!mongoose.Types.ObjectId.isValid(billId)) {
@@ -238,7 +407,7 @@ const getBillPayments = async (req, res) => {
 
     const bill = await Bill.findOne({
       _id: billId,
-      vendorId,
+      vendorId: actor.vendorId,
     });
 
     if (!bill) {
@@ -248,26 +417,33 @@ const getBillPayments = async (req, res) => {
       });
     }
 
+    if (actor.type === "delivery_agent") {
+      const customer = await Customer.findOne({
+        _id: bill.customerId,
+        vendorId: actor.vendorId,
+        deliveryAgentId: actor.agentId,
+      });
+
+      if (!customer) {
+        return res.status(403).json({
+          success: false,
+          message: "This customer is not assigned to you",
+        });
+      }
+    }
+
     const payments = await Payment.find({
-      vendorId,
+      vendorId: actor.vendorId,
       billId,
-    }).sort({
-      paymentDate: -1,
-      createdAt: -1,
-    });
+    }).sort({ paymentDate: -1, createdAt: -1 });
 
     return res.json({
       success: true,
       count: payments.length,
       payments,
     });
-
   } catch (error) {
-    console.error(
-      "Get bill payments error:",
-      error
-    );
-
+    console.error("Get bill payments error:", error);
     return res.status(500).json({
       success: false,
       message: "Failed to fetch bill payments",
@@ -275,14 +451,20 @@ const getBillPayments = async (req, res) => {
   }
 };
 
-
 // =====================================================
 // GET CUSTOMER PAYMENT HISTORY
 // =====================================================
 
 const getCustomerPayments = async (req, res) => {
   try {
-    const vendorId = req.user.userId;
+    const actor = await getActor(req);
+    if (!actor) {
+      return res.status(403).json({
+        success: false,
+        message: "Authorized user required",
+      });
+    }
+
     const { customerId } = req.params;
 
     if (!mongoose.Types.ObjectId.isValid(customerId)) {
@@ -294,7 +476,7 @@ const getCustomerPayments = async (req, res) => {
 
     const customer = await Customer.findOne({
       _id: customerId,
-      vendorId,
+      vendorId: actor.vendorId,
     });
 
     if (!customer) {
@@ -304,38 +486,40 @@ const getCustomerPayments = async (req, res) => {
       });
     }
 
+    if (
+      actor.type === "delivery_agent" &&
+      customer.deliveryAgentId?.toString() !== actor.agentId.toString()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "This customer is not assigned to you",
+      });
+    }
+
     const payments = await Payment.find({
-      vendorId,
+      vendorId: actor.vendorId,
       customerId,
     })
       .populate(
         "billId",
-        "billingMonth totalAmount paidAmount outstandingAmount status"
+        "billingMonth fromDate toDate totalAmount paidAmount outstandingAmount status"
       )
-      .sort({
-        paymentDate: -1,
-        createdAt: -1,
-      });
+      .populate("deliveryAgentId", "name mobileNumber")
+      .sort({ paymentDate: -1, createdAt: -1 });
 
     return res.json({
       success: true,
       count: payments.length,
       payments,
     });
-
   } catch (error) {
-    console.error(
-      "Get customer payments error:",
-      error
-    );
-
+    console.error("Get customer payments error:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch customer payments",
+      message: "Failed to fetch customer payment history",
     });
   }
 };
-
 
 // =====================================================
 // GET BILL PAYMENT SUMMARY
@@ -343,7 +527,14 @@ const getCustomerPayments = async (req, res) => {
 
 const getBillPaymentSummary = async (req, res) => {
   try {
-    const vendorId = req.user.userId;
+    const actor = await getActor(req);
+    if (!actor) {
+      return res.status(403).json({
+        success: false,
+        message: "Authorized user required",
+      });
+    }
+
     const { billId } = req.params;
 
     if (!mongoose.Types.ObjectId.isValid(billId)) {
@@ -355,7 +546,7 @@ const getBillPaymentSummary = async (req, res) => {
 
     const bill = await Bill.findOne({
       _id: billId,
-      vendorId,
+      vendorId: actor.vendorId,
     });
 
     if (!bill) {
@@ -363,6 +554,21 @@ const getBillPaymentSummary = async (req, res) => {
         success: false,
         message: "Bill not found",
       });
+    }
+
+    if (actor.type === "delivery_agent") {
+      const customer = await Customer.findOne({
+        _id: bill.customerId,
+        vendorId: actor.vendorId,
+        deliveryAgentId: actor.agentId,
+      });
+
+      if (!customer) {
+        return res.status(403).json({
+          success: false,
+          message: "This customer is not assigned to you",
+        });
+      }
     }
 
     const result = await Payment.aggregate([
@@ -376,16 +582,14 @@ const getBillPaymentSummary = async (req, res) => {
       {
         $group: {
           _id: null,
-          totalPaid: {
-            $sum: "$amount",
-          },
+          totalPaid: { $sum: "$amount" },
         },
       },
     ]);
 
     const totalPaid =
       result.length > 0
-        ? Number(result[0].totalPaid.toFixed(2))
+        ? roundMoney(result[0].totalPaid)
         : 0;
 
     return res.json({
@@ -395,26 +599,18 @@ const getBillPaymentSummary = async (req, res) => {
         totalAmount: bill.totalAmount,
         totalPaid,
         paidAmount: bill.paidAmount,
-        outstandingAmount:
-          bill.outstandingAmount,
+        outstandingAmount: bill.outstandingAmount,
         status: bill.status,
       },
     });
-
   } catch (error) {
-    console.error(
-      "Get bill payment summary error:",
-      error
-    );
-
+    console.error("Get bill payment summary error:", error);
     return res.status(500).json({
       success: false,
-      message:
-        "Failed to fetch payment summary",
+      message: "Failed to fetch payment summary",
     });
   }
 };
-
 
 module.exports = {
   addPayment,

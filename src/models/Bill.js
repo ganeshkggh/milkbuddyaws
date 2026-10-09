@@ -80,17 +80,6 @@ const billSchema = new mongoose.Schema(
   }
 );
 
-// One bill per customer per month
-billSchema.index(
-  {
-    vendorId: 1,
-    customerId: 1,
-    billingMonth: 1,
-  },
-  {
-    unique: true,
-  }
-);
 
 module.exports = mongoose.model(
   "Bill",

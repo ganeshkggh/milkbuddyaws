@@ -1,7 +1,6 @@
 const DeliveryAgent = require("../models/DeliveryAgent");
 const Customer = require("../models/Customer");
 const Delivery = require("../models/Delivery");
-
 // =====================================================
 // GET AGENT PROFILE
 // =====================================================

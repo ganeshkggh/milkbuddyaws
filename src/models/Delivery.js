@@ -18,6 +18,14 @@ const deliverySchema = new mongoose.Schema(
             index: true,
         },
 
+        // Delivery Agent assigned to customer/delivery
+        deliveryAgentId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "DeliveryAgent",
+            default: null,
+            index: true,
+        },
+
         // Date on which milk was delivered
         deliveryDate: {
             type: Date,
