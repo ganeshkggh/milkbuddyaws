@@ -189,7 +189,7 @@ const recordPayment = async (actor, customerId, bill, paymentInput, session) => 
             } },
             { $set: { status: { $cond: [{ $lte: ["$outstandingAmount", 0] }, "paid", "partially_paid"] } } },
         ],
-        { new: true, session }
+        { new: true, session, updatePipeline: true }
     );
     if (!updatedBill) throw Object.assign(new Error("Payment exceeds the bill's outstanding amount"), { statusCode: 409 });
 
