@@ -18,10 +18,17 @@ const deliverySchema = new mongoose.Schema(
             index: true,
         },
 
-        // Delivery Agent assigned to customer/delivery
         deliveryAgentId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "DeliveryAgent",
+            default: null,
+            index: true,
+        },
+        // Bill that includes this delivery.
+        // null means this delivery has not yet been billed.
+        billId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Bill",
             default: null,
             index: true,
         },
@@ -30,6 +37,12 @@ const deliverySchema = new mongoose.Schema(
         deliveryDate: {
             type: Date,
             required: true,
+            index: true,
+        },
+
+        deliveryDay: {
+            type: String,
+            match: /^\d{4}-\d{2}-\d{2}$/,
             index: true,
         },
 
@@ -107,6 +120,22 @@ deliverySchema.index(
     },
     {
         unique: true,
+    }
+);
+
+deliverySchema.index(
+    {
+        vendorId: 1,
+        customerId: 1,
+        deliveryDay: 1,
+        shift: 1,
+        product: 1,
+    },
+    {
+        unique: true,
+        partialFilterExpression: {
+            deliveryDay: { $type: "string" },
+        },
     }
 );
 

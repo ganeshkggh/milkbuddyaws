@@ -7,7 +7,13 @@ const {
     getAgentDashboard,
     getAgentCustomers,
     getAgentDeliveries,
+    getAgentTasks,
 } = require("../controllers/agentController");
+const {
+    createDelivery,
+    updateDelivery,
+    deleteDelivery,
+} = require("../controllers/deliveryController");
 
 const agentAuthMiddleware = require(
     "../middleware/agentAuthMiddleware"
@@ -39,6 +45,32 @@ router.get(
     "/deliveries",
     agentAuthMiddleware,
     getAgentDeliveries
+);
+
+// Agent tasks for a date
+router.get(
+    "/tasks",
+    agentAuthMiddleware,
+    getAgentTasks
+);
+
+// Create delivery by agent
+router.post(
+    "/deliveries",
+    agentAuthMiddleware,
+    createDelivery
+);
+
+router.put(
+    "/deliveries/:id",
+    agentAuthMiddleware,
+    updateDelivery
+);
+
+router.delete(
+    "/deliveries/:id",
+    agentAuthMiddleware,
+    deleteDelivery
 );
 
 module.exports = router;

@@ -1,6 +1,8 @@
 const User = require("../models/User");
 const DeliveryAgent = require("../models/DeliveryAgent");
 const Customer = require("../models/Customer");
+const mongoose = require("mongoose");
+const { getActiveVendor, getAssignedActiveAgent } = require("../services/vendorAuthorization");
 
 // =====================================================
 // CREATE DELIVERY AGENT
@@ -336,18 +338,16 @@ const activateDeliveryAgent = async (req, res) => {
 
 const assignCustomerToAgent = async (req, res) => {
     try {
-        const vendorId = req.user.userId;
+        const vendor = await getActiveVendor(req.user?.userId);
+        if (!vendor) return res.status(403).json({ success: false, message: "Active vendor account required" });
+        const vendorId = vendor._id;
 
         const { customerId } = req.params;
-        const { deliveryAgentId } = req.body;
+        const { deliveryAgentId } = req.body || {};
 
-        if (!deliveryAgentId) {
-            return res.status(400).json({
-                success: false,
-                message:
-                    "Delivery agent ID is required",
-            });
-        }
+        if (!mongoose.Types.ObjectId.isValid(customerId || "")) return res.status(400).json({ success: false, message: "Invalid customerId" });
+        if (!deliveryAgentId) return res.status(400).json({ success: false, message: "Delivery agent ID is required" });
+        if (!mongoose.Types.ObjectId.isValid(deliveryAgentId)) return res.status(400).json({ success: false, message: "Invalid deliveryAgentId" });
 
         const customer = await Customer.findOne({
             _id: customerId,
@@ -361,19 +361,7 @@ const assignCustomerToAgent = async (req, res) => {
             });
         }
 
-        const agent = await DeliveryAgent.findOne({
-            _id: deliveryAgentId,
-            vendorId,
-            status: "active",
-        });
-
-        if (!agent) {
-            return res.status(404).json({
-                success: false,
-                message:
-                    "Active delivery agent not found",
-            });
-        }
+        const agent = await getAssignedActiveAgent(vendorId, deliveryAgentId);
 
         customer.deliveryAgentId = agent._id;
 
@@ -391,6 +379,7 @@ const assignCustomerToAgent = async (req, res) => {
             error
         );
 
+        if (error.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
         return res.status(500).json({
             success: false,
             message: error.message || "Something went wrong",
@@ -404,8 +393,12 @@ const assignCustomerToAgent = async (req, res) => {
 
 const removeCustomerFromAgent = async (req, res) => {
     try {
-        const vendorId = req.user.userId;
+        const vendor = await getActiveVendor(req.user?.userId);
+        if (!vendor) return res.status(403).json({ success: false, message: "Active vendor account required" });
+        const vendorId = vendor._id;
         const { customerId } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(customerId || "")) return res.status(400).json({ success: false, message: "Invalid customerId" });
 
         const customer = await Customer.findOne({
             _id: customerId,
@@ -434,6 +427,7 @@ const removeCustomerFromAgent = async (req, res) => {
             error
         );
 
+        if (error.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
         return res.status(500).json({
             success: false,
             message: error.message || "Something went wrong",

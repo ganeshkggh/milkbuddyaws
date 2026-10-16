@@ -46,6 +46,18 @@ const billSchema = new mongoose.Schema(
       default: 0,
     },
 
+    currentPeriodAmount: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
+
+    previousOutstandingAmount: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
+
     paidAmount: {
       type: Number,
       required: true,
@@ -56,6 +68,12 @@ const billSchema = new mongoose.Schema(
     outstandingAmount: {
       type: Number,
       required: true,
+      min: 0,
+      default: 0,
+    },
+
+    creditAmount: {
+      type: Number,
       min: 0,
       default: 0,
     },
@@ -84,4 +102,9 @@ const billSchema = new mongoose.Schema(
 module.exports = mongoose.model(
   "Bill",
   billSchema
+);
+
+billSchema.index(
+  { vendorId: 1, customerId: 1, billingMonth: 1 },
+  { unique: true }
 );

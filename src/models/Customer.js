@@ -96,7 +96,7 @@ const customerSchema = new mongoose.Schema(
         // Delivery agent assigned to customer
         deliveryAgentId: {
             type: mongoose.Schema.Types.ObjectId,
-            ref: "User",
+            ref: "DeliveryAgent",
             default: null,
         },
     },

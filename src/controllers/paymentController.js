@@ -116,10 +116,13 @@ const addPayment = async (req, res) => {
       });
     }
 
-    if (paymentMethod !== "cash") {
+    const allowedMethods = ["cash", "upi", "bank_transfer", "other"];
+    const normalizedMethod = typeof paymentMethod === "string" ? paymentMethod.toLowerCase() : "";
+
+    if (!allowedMethods.includes(normalizedMethod)) {
       return res.status(400).json({
         success: false,
-        message: "Currently only cash payments are enabled",
+        message: "Invalid payment method. Supported methods: cash, upi, bank_transfer, other",
       });
     }
 
@@ -143,6 +146,8 @@ const addPayment = async (req, res) => {
         message: "A unique idempotencyKey is required",
       });
     }
+
+    const requestIdempotencyKey = idempotencyKey.trim();
 
     // Customer must belong to the actor's vendor.
     const customer = await Customer.findOne({
@@ -188,14 +193,15 @@ const addPayment = async (req, res) => {
     // Idempotency: return the existing payment for a retry.
     const existingPayment = await Payment.findOne({
       vendorId: actor.vendorId,
-      idempotencyKey: idempotencyKey.trim(),
+      idempotencyKey: requestIdempotencyKey,
     });
 
     if (existingPayment) {
       if (
         existingPayment.billId.toString() !== billId ||
         existingPayment.customerId.toString() !== customerId ||
-        roundMoney(existingPayment.amount) !== roundMoney(paymentAmount)
+          roundMoney(existingPayment.amount) !== roundMoney(paymentAmount) ||
+          existingPayment.paymentMethod !== normalizedMethod
       ) {
         return res.status(409).json({
           success: false,
@@ -228,113 +234,73 @@ const addPayment = async (req, res) => {
         .slice(-6)
         .toUpperCase()}`;
 
-    // Conditional update prevents two concurrent requests from
-    // successfully collecting more than the outstanding amount.
-    const updatedBill = await Bill.findOneAndUpdate(
-      {
-        _id: bill._id,
-        vendorId: actor.vendorId,
-        customerId,
-        outstandingAmount: { $gte: amountToPay },
-      },
-      [
-        {
-          $set: {
-            paidAmount: {
-              $round: [
-                { $add: ["$paidAmount", amountToPay] },
-                2,
-              ],
-            },
-            outstandingAmount: {
-              $round: [
-                {
-                  $max: [
-                    { $subtract: ["$outstandingAmount", amountToPay] },
-                    0,
-                  ],
-                },
-                2,
-              ],
-            },
-          },
-        },
-        {
-          $set: {
-            status: {
-              $cond: [
-                { $eq: ["$outstandingAmount", 0] },
-                "paid",
-                {
-                  $cond: [
-                    { $gt: ["$paidAmount", 0] },
-                    "partially_paid",
-                    "unpaid",
-                  ],
-                },
-              ],
-            },
-          },
-        },
-      ],
-      { new: true }
-    );
-
-    if (!updatedBill) {
-      return res.status(409).json({
-        success: false,
-        message: "Bill balance changed. Refresh and try again.",
-      });
-    }
-
+    const session = await mongoose.startSession();
+    let updatedBill;
     let payment;
 
     try {
-      payment = await Payment.create({
-        vendorId: actor.vendorId,
-        customerId,
-        billId,
-        amount: amountToPay,
-        paymentDate: paymentDate || new Date(),
-        paymentMethod: "cash",
-        referenceNumber: referenceNumber || "",
-        notes: notes || "",
-        collectorType: actor.type,
-        deliveryAgentId: actor.agentId,
-        collectorName: actor.name,
-        collectedByUserId: actor.userId,
-        receiptNumber,
-        idempotencyKey: idempotencyKey.trim(),
-        whatsappStatus: "not_configured",
+      await session.withTransaction(async () => {
+        const lockedBill = await Bill.findOne({
+          _id: bill._id,
+          vendorId: actor.vendorId,
+          customerId,
+          outstandingAmount: { $gte: amountToPay },
+        }).session(session);
+
+        if (!lockedBill) {
+          throw Object.assign(new Error("Bill balance changed. Refresh and try again."), {
+            statusCode: 409,
+          });
+        }
+
+        lockedBill.paidAmount = roundMoney(lockedBill.paidAmount + amountToPay);
+        lockedBill.outstandingAmount = roundMoney(
+          Math.max(lockedBill.outstandingAmount - amountToPay, 0)
+        );
+        lockedBill.status = getBillStatus(
+          lockedBill.paidAmount,
+          lockedBill.totalAmount
+        );
+
+        updatedBill = await lockedBill.save({ session });
+
+        const createdPayments = await Payment.create(
+          [{
+            vendorId: actor.vendorId,
+            customerId,
+            billId,
+            amount: amountToPay,
+            paymentDate: paymentDate || new Date(),
+            paymentMethod: normalizedMethod,
+            referenceNumber: referenceNumber || "",
+            notes: notes || "",
+            collectorType: actor.type,
+            deliveryAgentId: actor.agentId,
+            collectorName: actor.name,
+            collectedByUserId: actor.userId,
+            receiptNumber,
+            idempotencyKey: requestIdempotencyKey,
+            whatsappStatus: "not_configured",
+          }],
+          { session }
+        );
+
+        payment = createdPayments[0];
       });
     } catch (error) {
-      // Restore the bill balance if payment insertion fails.
-      await Bill.updateOne(
-        {
-          _id: updatedBill._id,
-          vendorId: actor.vendorId,
-        },
-        {
-          $inc: {
-            paidAmount: -amountToPay,
-            outstandingAmount: amountToPay,
-          },
-          $set: {
-            status: getBillStatus(
-              roundMoney(updatedBill.paidAmount - amountToPay),
-              updatedBill.totalAmount
-            ),
-          },
-        }
-      );
-
       if (error.code === 11000) {
         const duplicate = await Payment.findOne({
           vendorId: actor.vendorId,
-          idempotencyKey: idempotencyKey.trim(),
+          idempotencyKey: requestIdempotencyKey,
         });
 
-        if (duplicate) {
+        if (
+          duplicate &&
+          duplicate.billId.toString() === billId &&
+          duplicate.customerId.toString() === customerId &&
+          roundMoney(duplicate.amount) === roundMoney(paymentAmount) &&
+          duplicate.paymentMethod === normalizedMethod
+        ) {
           return res.status(200).json({
             success: true,
             duplicate: true,
@@ -342,9 +308,25 @@ const addPayment = async (req, res) => {
             payment: duplicate,
           });
         }
+        if (duplicate) {
+          return res.status(409).json({ success: false, message: "Idempotency key was already used for another payment" });
+        }
+      }
+
+      if (error.statusCode === 400 || error.statusCode === 404) {
+        return res.status(error.statusCode).json({ success: false, message: error.message });
+      }
+
+      if (error.statusCode === 409) {
+        return res.status(409).json({
+          success: false,
+          message: error.message,
+        });
       }
 
       throw error;
+    } finally {
+      session.endSession();
     }
 
     return res.status(201).json({

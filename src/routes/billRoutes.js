@@ -7,6 +7,7 @@ const {
   getBills,
   getBillById,
   getCustomerBills,
+  sendBillReceipt,
 } = require("../controllers/billController");
 
 const authMiddleware = require("../middleware/authMiddleware");
@@ -27,6 +28,12 @@ router.get(
   "/customer/:customerId",
   authMiddleware,
   getCustomerBills
+);
+
+router.post(
+  "/:billId/send-receipt",
+  authMiddleware,
+  sendBillReceipt
 );
 
 router.get(
