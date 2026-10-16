@@ -15,6 +15,12 @@ const userSchema = new mongoose.Schema(
             trim: true,
         },
 
+        address: {
+            type: String,
+            default: "",
+            trim: true,
+        },
+
         userType: {
             type: String,
             enum: ["vendor", "agent"],
@@ -24,6 +30,12 @@ const userSchema = new mongoose.Schema(
         isActive: {
             type: Boolean,
             default: true,
+        },
+
+        registrationPending: {
+            type: Boolean,
+            default: false,
+            index: true,
         },
 
         lastLoginAt: {

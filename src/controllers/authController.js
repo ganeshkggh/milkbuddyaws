@@ -1,335 +1,370 @@
-const User = require("../models/User");
-const Otp = require("../models/Otp");
 
+const User = require("../models/User");
 const {
     generateAccessToken,
     generateRefreshToken,
 } = require("../services/tokenService");
+const {
+    normalizeMobileNumber,
+    issueOtp,
+    consumeOtp,
+} = require("../services/authService");
 
-// =====================================================
-// SEND OTP
-// =====================================================
+const getMobile = (body = {}) =>
+    normalizeMobileNumber(body.mobileNumber ?? body.mobile);
 
-const sendOtp = async (req, res) => {
+const sendError = (res, error, fallback = "Something went wrong") => {
+    const status = Number.isInteger(error.statusCode)
+        ? error.statusCode
+        : error.code === 11000
+            ? 409
+            : 500;
+
+    if (status >= 500) {
+        console.error("Authentication error:", error.message);
+    }
+
+    return res.status(status).json({
+        success: false,
+        message: status >= 500 ? fallback : error.message,
+    });
+};
+
+const getTokens = (user) => ({
+    accessToken: generateAccessToken(user),
+    refreshToken: generateRefreshToken(user),
+});
+
+const publicUser = (user) => ({
+    id: user._id,
+    mobileNumber: user.mobileNumber,
+    name: user.name,
+    userType: user.userType,
+    isActive: user.isActive,
+});
+
+// Check whether a mobile number already has an account.
+const checkVendor = async (req, res) => {
     try {
-        const { mobileNumber } = req.body;
+        const mobileNumber = getMobile(req.body);
 
-        // Validate mobile number
         if (!mobileNumber) {
             return res.status(400).json({
                 success: false,
-                message: "Mobile number is required",
+                message: "Enter a valid 10-digit Indian mobile number",
             });
         }
 
-        if (!/^[0-9]{10}$/.test(mobileNumber)) {
-            return res.status(400).json({
-                success: false,
-                message: "Enter a valid 10-digit mobile number",
-            });
-        }
-
-        // Development OTP
-        // Later we will replace this with a real SMS service.
-        const otp = "123456";
-
-        // OTP expires after 5 minutes
-        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
-
-        // Delete previous OTP for this mobile number
-        await Otp.deleteMany({
-            mobileNumber,
-        });
-
-        // Save new OTP
-        await Otp.create({
-            mobileNumber,
-            otp,
-            expiresAt,
-            verified: false,
-        });
+        const user = await User.findOne({ mobileNumber });
 
         return res.status(200).json({
             success: true,
-            message: "OTP sent successfully",
-            mobileNumber,
-            expiresIn: 300,
+            isRegistered: Boolean(
+                user &&
+                user.userType === "vendor" &&
+                user.isActive &&
+                !user.registrationPending
+            ),
+            role: user?.userType ?? null,
+            userType: user?.userType ?? null,
         });
     } catch (error) {
-        console.error("Send OTP error:", error);
-
-        return res.status(500).json({
-            success: false,
-            message: "Something went wrong",
-        });
+        return sendError(res, error);
     }
 };
 
-// =====================================================
-// VERIFY OTP
-// =====================================================
-
-const verifyOtp = async (req, res) => {
+// Start a new Vendor registration or resume a pending registration.
+const startVendorRegistration = async (req, res) => {
     try {
-        const { mobileNumber, otp } = req.body;
+        const mobileNumber = getMobile(req.body);
+        const name = typeof req.body?.name === "string"
+            ? req.body.name.trim()
+            : "";
+        const address = typeof req.body?.address === "string"
+            ? req.body.address.trim()
+            : "";
 
-        // Validate request
-        if (!mobileNumber || !otp) {
+        if (!mobileNumber) {
             return res.status(400).json({
                 success: false,
-                message: "Mobile number and OTP are required",
+                message: "Enter a valid 10-digit Indian mobile number",
             });
         }
 
-        // Validate mobile number
-        if (!/^[0-9]{10}$/.test(mobileNumber)) {
+        if (!name || name.length > 100) {
             return res.status(400).json({
                 success: false,
-                message: "Enter a valid 10-digit mobile number",
+                message: "Name is required and must be at most 100 characters",
             });
         }
 
-        // Find latest OTP
-        const otpRecord = await Otp.findOne({
-            mobileNumber,
-            otp,
-            verified: false,
-        }).sort({
-            createdAt: -1,
-        });
-
-        // OTP not found
-        if (!otpRecord) {
+        if (!address || address.length > 500) {
             return res.status(400).json({
                 success: false,
-                message: "Invalid OTP",
+                message: "Address is required and must be at most 500 characters",
             });
         }
 
-        // Check OTP expiration
-        if (otpRecord.expiresAt < new Date()) {
-            return res.status(400).json({
+        let user = await User.findOne({ mobileNumber });
+
+        if (user && user.userType !== "vendor") {
+            return res.status(409).json({
                 success: false,
-                message: "OTP has expired",
+                message: "This mobile number belongs to an Agent account",
             });
         }
 
-        // Mark OTP as verified
-        otpRecord.verified = true;
-        await otpRecord.save();
+        if (user && user.isActive && !user.registrationPending) {
+            return res.status(409).json({
+                success: false,
+                message: "Vendor account already exists. Please log in.",
+            });
+        }
 
-        // Find existing user
-        let user = await User.findOne({
-            mobileNumber,
-        });
+        if (user && !user.registrationPending) {
+            return res.status(403).json({
+                success: false,
+                message: "This Vendor account is inactive. Contact support.",
+            });
+        }
 
-        // Create user if first login
         if (!user) {
             user = await User.create({
                 mobileNumber,
+                name,
+                address,
                 userType: "vendor",
-                isActive: true,
+                isActive: false,
+                registrationPending: true,
             });
+        } else {
+            user.name = name;
+            user.address = address;
+            user.isActive = false;
+            user.registrationPending = true;
+            await user.save();
         }
 
-        // Check if user is active
-        if (!user.isActive) {
-            return res.status(403).json({
-                success: false,
-                message: "Your account is inactive",
-            });
-        }
-
-        // Update last login
-        user.lastLoginAt = new Date();
-        await user.save();
-
-        // Generate JWT access token
-        const accessToken = generateAccessToken(user);
-
-        // Generate JWT refresh token
-        const refreshToken = generateRefreshToken(user);
-
-        // Return successful response
-        return res.status(200).json({
-            success: true,
-            message: "OTP verified successfully",
-
-            user: {
-                id: user._id,
-                mobileNumber: user.mobileNumber,
-                name: user.name,
-                userType: user.userType,
-                isActive: user.isActive,
-            },
-
-            tokens: {
-                accessToken,
-                refreshToken,
-            },
-        });
-    } catch (error) {
-    console.error("=================================");
-    console.error("VERIFY OTP ERROR");
-    console.error("Name:", error.name);
-    console.error("Message:", error.message);
-    console.error("Stack:", error.stack);
-    console.error("=================================");
-
-    return res.status(500).json({
-        success: false,
-        message: error.message || "Something went wrong",
-    });
-}
-};
-
-// =====================================================
-// EXPORT
-// =====================================================
-
-// =====================================================
-// SEND AGENT OTP
-// =====================================================
-
-const sendAgentOtp = async (req, res) => {
-    try {
-        const { mobileNumber } = req.body;
-
-        // Validate mobile number
-        if (!mobileNumber) {
-            return res.status(400).json({
-                success: false,
-                message: "Mobile number is required",
-            });
-        }
-
-        if (!/^[0-9]{10}$/.test(mobileNumber)) {
-            return res.status(400).json({
-                success: false,
-                message: "Enter a valid 10-digit mobile number",
-            });
-        }
-
-        // Find delivery agent user
-        const user = await User.findOne({
+        const result = await issueOtp(
             mobileNumber,
-            userType: "agent",
-        });
-
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                message:
-                    "Delivery agent account not found",
-            });
-        }
-
-        // Check account status
-        if (!user.isActive) {
-            return res.status(403).json({
-                success: false,
-                message:
-                    "Delivery agent account is inactive",
-            });
-        }
-
-        // Development OTP
-        const otp = "123456";
-
-        // OTP expires after 5 minutes
-        const expiresAt = new Date(
-            Date.now() + 5 * 60 * 1000
+            "vendor_registration"
         );
-
-        // Remove previous OTP
-        await Otp.deleteMany({
-            mobileNumber,
-        });
-
-        // Save new OTP
-        await Otp.create({
-            mobileNumber,
-            otp,
-            expiresAt,
-            verified: false,
-        });
 
         return res.status(200).json({
             success: true,
-            message: "Agent OTP sent successfully",
+            message: "Registration OTP requested",
             mobileNumber,
-            expiresIn: 300,
+            expiresIn: result.expiresIn,
         });
     } catch (error) {
-        console.error(
-            "Send Agent OTP error:",
-            error
-        );
-
-        return res.status(500).json({
-            success: false,
-            message:
-                error.message ||
-                "Something went wrong",
-        });
+        return sendError(res, error, "Unable to start Vendor registration");
     }
 };
 
-
-// =====================================================
-// VERIFY AGENT OTP
-// =====================================================
-
-const verifyAgentOtp = async (req, res) => {
+// Resend OTP only for a pending Vendor registration.
+const resendVendorRegistrationOtp = async (req, res) => {
     try {
-        const {
-            mobileNumber,
-            otp,
-        } = req.body;
+        const mobileNumber = getMobile(req.body);
 
-        // Validate request
-        if (!mobileNumber || !otp) {
+        if (!mobileNumber) {
             return res.status(400).json({
                 success: false,
-                message:
-                    "Mobile number and OTP are required",
+                message: "Enter a valid 10-digit Indian mobile number",
             });
         }
 
-        // Validate mobile number
-        if (!/^[0-9]{10}$/.test(mobileNumber)) {
-            return res.status(400).json({
-                success: false,
-                message:
-                    "Enter a valid 10-digit mobile number",
-            });
-        }
-
-        // Find OTP
-        const otpRecord = await Otp.findOne({
+        const user = await User.findOne({
             mobileNumber,
-            otp,
-            verified: false,
-        }).sort({
-            createdAt: -1,
+            userType: "vendor",
+            isActive: false,
+            registrationPending: true,
         });
 
-        if (!otpRecord) {
-            return res.status(400).json({
+        if (!user) {
+            return res.status(404).json({
                 success: false,
-                message: "Invalid OTP",
+                message: "No pending Vendor registration was found",
             });
         }
 
-        // Check expiration
-        if (otpRecord.expiresAt < new Date()) {
+        const result = await issueOtp(
+            mobileNumber,
+            "vendor_registration"
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Registration OTP requested",
+            mobileNumber,
+            expiresIn: result.expiresIn,
+        });
+    } catch (error) {
+        return sendError(res, error, "Unable to resend registration OTP");
+    }
+};
+
+// Verify registration OTP, then activate the pending Vendor.
+const verifyVendorRegistrationOtp = async (req, res) => {
+    try {
+        const mobileNumber = getMobile(req.body);
+        const otp = String(req.body?.otp ?? "").trim();
+
+        if (!mobileNumber || !/^\d{6}$/.test(otp)) {
             return res.status(400).json({
                 success: false,
-                message: "OTP has expired",
+                message: "A valid mobile number and 6-digit OTP are required",
             });
         }
 
-        // Find agent
+        const pendingUser = await User.findOne({
+            mobileNumber,
+            userType: "vendor",
+            isActive: false,
+            registrationPending: true,
+        });
+
+        if (!pendingUser) {
+            return res.status(404).json({
+                success: false,
+                message: "No pending Vendor registration was found",
+            });
+        }
+
+        await consumeOtp(mobileNumber, otp, "vendor_registration");
+
+        // Conditional update prevents activation if the account state changed.
+        const user = await User.findOneAndUpdate(
+            {
+                _id: pendingUser._id,
+                userType: "vendor",
+                isActive: false,
+                registrationPending: true,
+            },
+            {
+                $set: {
+                    isActive: true,
+                    registrationPending: false,
+                    lastLoginAt: new Date(),
+                },
+            },
+            { new: true, runValidators: true }
+        );
+
+        if (!user) {
+            return res.status(409).json({
+                success: false,
+                message: "Registration state changed. Please check your account.",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Vendor registration completed successfully",
+            user: publicUser(user),
+            tokens: getTokens(user),
+        });
+    } catch (error) {
+        return sendError(res, error, "Unable to verify registration OTP");
+    }
+};
+
+// Vendor login: existing, active Vendor accounts only.
+const sendOtp = async (req, res) => {
+    try {
+        const mobileNumber = getMobile(req.body);
+
+        if (!mobileNumber) {
+            return res.status(400).json({
+                success: false,
+                message: "Enter a valid 10-digit Indian mobile number",
+            });
+        }
+
+        const user = await User.findOne({ mobileNumber });
+
+        if (!user || user.userType !== "vendor") {
+            return res.status(404).json({
+                success: false,
+                message: "Vendor account not found. Please register first.",
+            });
+        }
+
+        if (!user.isActive || user.registrationPending) {
+            return res.status(403).json({
+                success: false,
+                message: "Vendor account is inactive or registration is incomplete",
+            });
+        }
+
+        const result = await issueOtp(mobileNumber, "vendor_login");
+
+        return res.status(200).json({
+            success: true,
+            message: "Login OTP requested",
+            mobileNumber,
+            expiresIn: result.expiresIn,
+        });
+    } catch (error) {
+        return sendError(res, error, "Unable to request login OTP");
+    }
+};
+
+const verifyOtp = async (req, res) => {
+    try {
+        const mobileNumber = getMobile(req.body);
+        const otp = String(req.body?.otp ?? "").trim();
+
+        if (!mobileNumber || !/^\d{6}$/.test(otp)) {
+            return res.status(400).json({
+                success: false,
+                message: "A valid mobile number and 6-digit OTP are required",
+            });
+        }
+
+        const user = await User.findOne({ mobileNumber });
+
+        if (!user || user.userType !== "vendor") {
+            return res.status(404).json({
+                success: false,
+                message: "Vendor account not found",
+            });
+        }
+
+        if (!user.isActive || user.registrationPending) {
+            return res.status(403).json({
+                success: false,
+                message: "Vendor account is inactive or registration is incomplete",
+            });
+        }
+
+        await consumeOtp(mobileNumber, otp, "vendor_login");
+
+        user.lastLoginAt = new Date();
+        await user.save();
+
+        return res.status(200).json({
+            success: true,
+            message: "OTP verified successfully",
+            user: publicUser(user),
+            tokens: getTokens(user),
+        });
+    } catch (error) {
+        return sendError(res, error, "Unable to verify login OTP");
+    }
+};
+
+// Agent login: existing, active Agent accounts only.
+const sendAgentOtp = async (req, res) => {
+    try {
+        const mobileNumber = getMobile(req.body);
+
+        if (!mobileNumber) {
+            return res.status(400).json({
+                success: false,
+                message: "Enter a valid 10-digit Indian mobile number",
+            });
+        }
+
         const user = await User.findOne({
             mobileNumber,
             userType: "agent",
@@ -338,74 +373,84 @@ const verifyAgentOtp = async (req, res) => {
         if (!user) {
             return res.status(404).json({
                 success: false,
-                message:
-                    "Delivery agent account not found",
+                message: "Delivery agent account not found",
             });
         }
 
-        // Check account status
         if (!user.isActive) {
             return res.status(403).json({
                 success: false,
-                message:
-                    "Delivery agent account is inactive",
+                message: "Delivery agent account is inactive",
             });
         }
 
-        // Mark OTP as verified
-        otpRecord.verified = true;
-        await otpRecord.save();
-
-        // Update last login
-        user.lastLoginAt = new Date();
-        await user.save();
-
-        // Generate tokens
-        const accessToken =
-            generateAccessToken(user);
-
-        const refreshToken =
-            generateRefreshToken(user);
+        const result = await issueOtp(mobileNumber, "agent_login");
 
         return res.status(200).json({
             success: true,
-            message:
-                "Agent OTP verified successfully",
-
-            user: {
-                id: user._id,
-                mobileNumber:
-                    user.mobileNumber,
-                name: user.name,
-                userType:
-                    user.userType,
-                isActive:
-                    user.isActive,
-            },
-
-            tokens: {
-                accessToken,
-                refreshToken,
-            },
+            message: "Agent login OTP requested",
+            mobileNumber,
+            expiresIn: result.expiresIn,
         });
     } catch (error) {
-        console.error(
-            "Verify Agent OTP error:",
-            error
-        );
+        return sendError(res, error, "Unable to request Agent OTP");
+    }
+};
 
-        return res.status(500).json({
-            success: false,
-            message:
-                error.message ||
-                "Something went wrong",
+const verifyAgentOtp = async (req, res) => {
+    try {
+        const mobileNumber = getMobile(req.body);
+        const otp = String(req.body?.otp ?? "").trim();
+
+        if (!mobileNumber || !/^\d{6}$/.test(otp)) {
+            return res.status(400).json({
+                success: false,
+                message: "A valid mobile number and 6-digit OTP are required",
+            });
+        }
+
+        const user = await User.findOne({
+            mobileNumber,
+            userType: "agent",
         });
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "Delivery agent account not found",
+            });
+        }
+
+        if (!user.isActive) {
+            return res.status(403).json({
+                success: false,
+                message: "Delivery agent account is inactive",
+            });
+        }
+
+        await consumeOtp(mobileNumber, otp, "agent_login");
+
+        user.lastLoginAt = new Date();
+        await user.save();
+
+        return res.status(200).json({
+            success: true,
+            message: "Agent OTP verified successfully",
+            user: publicUser(user),
+            tokens: getTokens(user),
+        });
+    } catch (error) {
+        return sendError(res, error, "Unable to verify Agent OTP");
     }
 };
 
 module.exports = {
+    checkVendor,
+    startVendorRegistration,
+    resendVendorRegistrationOtp,
+    verifyVendorRegistrationOtp,
     sendOtp,
     verifyOtp,
-     sendAgentOtp,
+    sendAgentOtp,
     verifyAgentOtp,
 };

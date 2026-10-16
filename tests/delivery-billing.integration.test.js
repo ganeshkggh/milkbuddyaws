@@ -9,6 +9,7 @@ const Delivery = require("../src/models/Delivery");
 const Bill = require("../src/models/Bill");
 const Payment = require("../src/models/Payment");
 const { createDelivery, getDeliveries, updateDelivery, deleteDelivery } = require("../src/controllers/deliveryController");
+const { addExtraMilk } = require("../src/controllers/deliveryController");
 const { generateBill, getBills, getBillById, getCustomerBills, sendBillReceipt } = require("../src/controllers/billController");
 const { addPayment } = require("../src/controllers/paymentController");
 const { getCustomers, getCustomerById } = require("../src/controllers/customerController");
@@ -91,6 +92,19 @@ if (!mongoTestUri) {
         status: "active",
       });
       owned.otherCustomerId = otherCustomer._id;
+      const extraMilkCustomer = await Customer.create({
+        vendorId: vendor._id,
+        customerNumber: 900004,
+        name: "Extra Milk Customer",
+        phone: "9876543213",
+        ratePerLiter: 36,
+        dailyQuantity: 2,
+        shift: "Morning",
+        product: "Milk",
+        status: "active",
+        deliveryAgentId: agent._id,
+      });
+      owned.createdCustomerIds.push(extraMilkCustomer._id);
       const unassignedCustomer = await Customer.create({
         vendorId: vendor._id,
         customerNumber: 900003,
@@ -169,6 +183,41 @@ if (!mongoTestUri) {
       assert.equal(foreignAgentAssignment.statusCode, 404);
       assert.equal(agentAssignmentAttempt.statusCode, 403);
 
+      const originalExtraDelivery = await invoke(createDelivery, vendor._id, {
+        customerId: extraMilkCustomer._id.toString(),
+        deliveryDate: "2026-10-10",
+        quantityLiters: 2,
+        shift: "Morning",
+        product: "Milk",
+        paymentChoice: "unpaid",
+      });
+      assert.equal(originalExtraDelivery.statusCode, 201);
+      assert.equal(originalExtraDelivery.body.delivery.amount, 72);
+      const originalExtraBill = await invoke(generateBill, vendor._id, {
+        customerId: extraMilkCustomer._id.toString(),
+        billingMonth: "2026-10",
+      });
+      assert.equal(originalExtraBill.statusCode, 201);
+
+      const extraDeliveryCountBefore = await Delivery.countDocuments({ customerId: extraMilkCustomer._id });
+      const extraPaymentCountBefore = await Payment.countDocuments({ customerId: extraMilkCustomer._id });
+      const extraMilkResult = await invoke(addExtraMilk, vendor._id, {
+        additionalQuantityLiters: 1,
+      }, { id: originalExtraDelivery.body.delivery._id.toString() });
+      assert.equal(extraMilkResult.statusCode, 200);
+      assert.equal(extraMilkResult.body.addedQuantityLiters, 1);
+      assert.equal(extraMilkResult.body.delivery.quantityLiters, 3);
+      assert.equal(extraMilkResult.body.delivery.amount, 108);
+      assert.equal(await Delivery.countDocuments({ customerId: extraMilkCustomer._id }), extraDeliveryCountBefore);
+      assert.equal(await Payment.countDocuments({ customerId: extraMilkCustomer._id }), extraPaymentCountBefore);
+      const refreshedExtraBill = await Bill.findById(originalExtraBill.body.bill._id);
+      assert.equal(refreshedExtraBill.currentPeriodAmount, 108);
+
+      const agentExtraMilkAttempt = await invoke(addExtraMilk, agentUser._id, {
+        additionalQuantityLiters: 1,
+      }, { id: originalExtraDelivery.body.delivery._id.toString() });
+      assert.equal(agentExtraMilkAttempt.statusCode, 403);
+
       const vendorCustomerRead = await invoke(getCustomerById, vendor._id, {}, { id: customer._id.toString() });
       const agentCustomerRead = await invoke(getCustomerById, agentUser._id, {}, { id: customer._id.toString() });
       const agentCustomerList = await invoke(getCustomers, agentUser._id);
@@ -178,7 +227,11 @@ if (!mongoTestUri) {
       assert.equal(vendorCustomerRead.statusCode, 200);
       assert.equal(agentCustomerRead.statusCode, 200);
       assert.equal(agentCustomerRead.body.customer._id.toString(), customer._id.toString());
-      assert.deepEqual(agentCustomerList.body.customers.map((entry) => entry._id.toString()), [customer._id.toString(), createdCustomerResponse.body.customer._id.toString()]);
+      assert.deepEqual(agentCustomerList.body.customers.map((entry) => entry._id.toString()), [
+        customer._id.toString(),
+        extraMilkCustomer._id.toString(),
+        createdCustomerResponse.body.customer._id.toString(),
+      ]);
       assert.equal(agentAssignedList.body.customers[0]._id.toString(), customer._id.toString());
       assert.equal(agentTasks.body.tasks[0].customerId.toString(), customer._id.toString());
       assert.equal(inaccessibleCustomerRead.statusCode, 404);
@@ -249,6 +302,28 @@ if (!mongoTestUri) {
       }, { id: evening.body.delivery._id.toString() });
       assert.equal(agentDeliveryUpdate.statusCode, 200);
       assert.equal(agentDeliveryUpdate.body.delivery.notes, "Updated by assigned agent");
+      const deliveryCountAfterEdit = await Delivery.countDocuments({ customerId: customer._id });
+      const paymentCountAfterEdit = await Payment.countDocuments({ customerId: customer._id });
+      assert.equal(deliveryCountAfterEdit, 4);
+      assert.equal(paymentCountAfterEdit, 0);
+
+      const otherVendorDelivery = await invoke(createDelivery, secondVendor._id, {
+        customerId: otherCustomer._id.toString(),
+        deliveryDate: "2026-10-09",
+        quantityLiters: 1,
+        shift: "Morning",
+        product: "Milk",
+        paymentChoice: "unpaid",
+      });
+      assert.equal(otherVendorDelivery.statusCode, 201);
+      const unauthorizedDeliveryUpdate = await invoke(updateDelivery, agentUser._id, {
+        notes: "Should be forbidden",
+      }, { id: otherVendorDelivery.body.delivery._id.toString() });
+      assert.equal(unauthorizedDeliveryUpdate.statusCode, 404);
+      const crossVendorExtraMilkAttempt = await invoke(addExtraMilk, vendor._id, {
+        additionalQuantityLiters: 1,
+      }, { id: otherVendorDelivery.body.delivery._id.toString() });
+      assert.equal(crossVendorExtraMilkAttempt.statusCode, 404);
 
       const vendorGeneratedBill = await invoke(generateBill, vendor._id, {
         customerId: unassignedCustomer._id.toString(),

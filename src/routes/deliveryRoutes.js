@@ -5,6 +5,7 @@ const router = express.Router();
 const {
   createDelivery,
   getDeliveries,
+  addExtraMilk,
   updateDelivery,
   deleteDelivery,
 } = require("../controllers/deliveryController");
@@ -21,6 +22,11 @@ router.get(
   "/",
   authMiddleware,
   getDeliveries
+);
+router.patch(
+  "/:id/extra-milk",
+  authMiddleware,
+  addExtraMilk
 );
 router.put(
   "/:id",

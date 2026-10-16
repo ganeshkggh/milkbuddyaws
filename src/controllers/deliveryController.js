@@ -387,13 +387,87 @@ const deleteDelivery = async (req, res) => {
     }
 };
 
+const calculateExtraMilkUpdate = (delivery, additionalQuantityLiters) => {
+    const additionalQuantity = Number(additionalQuantityLiters);
+    if (!Number.isFinite(additionalQuantity) || additionalQuantity <= 0) {
+        throw Object.assign(new Error("additionalQuantityLiters must be greater than zero"), { statusCode: 400 });
+    }
+    if (delivery.isNoDelivery || Number(delivery.quantityLiters) <= 0) {
+        throw Object.assign(new Error("Extra milk can only be added to a completed delivery"), { statusCode: 400 });
+    }
+
+    const rateAtTime = Number(delivery.rateAtTime);
+    if (!Number.isFinite(rateAtTime) || rateAtTime < 0) {
+        throw Object.assign(new Error("Delivery has an invalid saved rate"), { statusCode: 409 });
+    }
+    const finalQuantity = Number((Number(delivery.quantityLiters) + additionalQuantity).toPrecision(15));
+    return {
+        additionalQuantityLiters: additionalQuantity,
+        quantityLiters: finalQuantity,
+        amount: roundMoney(finalQuantity * rateAtTime),
+    };
+};
+
+const addExtraMilk = async (req, res) => {
+    let session;
+    try {
+        const actor = await getActor(req);
+        if (!actor || actor.type !== "vendor") {
+            return res.status(403).json({ success: false, message: "Vendor account required for extra-milk updates" });
+        }
+
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id || "")) {
+            return res.status(400).json({ success: false, message: "Invalid delivery id" });
+        }
+
+        session = await mongoose.startSession();
+        let updatedDelivery;
+        let additionalQuantity;
+
+        await session.withTransaction(async () => {
+            const delivery = await Delivery.findOne({ _id: id, vendorId: actor.vendorId }).session(session);
+            if (!delivery) throw Object.assign(new Error("Delivery not found"), { statusCode: 404 });
+
+            await getCustomerForActor(actor, delivery.customerId, false);
+            const recalculated = calculateExtraMilkUpdate(delivery, req.body?.additionalQuantityLiters);
+            additionalQuantity = recalculated.additionalQuantityLiters;
+            delivery.quantityLiters = recalculated.quantityLiters;
+            delivery.amount = recalculated.amount;
+            updatedDelivery = await delivery.save({ session });
+
+            await refreshBillsFromMonth(
+                actor.vendorId,
+                delivery.customerId,
+                getBillingMonthKeyFromDate(delivery.deliveryDate),
+                session,
+            );
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: "Extra milk added to delivery successfully",
+            addedQuantityLiters: additionalQuantity,
+            delivery: withDeliveryStatus(updatedDelivery),
+        });
+    } catch (error) {
+        if (error.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
+        console.error("Add extra milk error:", error);
+        return res.status(500).json({ success: false, message: "Failed to add extra milk" });
+    } finally {
+        if (session) await session.endSession();
+    }
+};
+
 module.exports = {
     createDelivery,
     getDeliveries,
+    addExtraMilk,
     updateDelivery,
     deleteDelivery,
     normalizeDeliveryShift,
     parseDeliveryDate,
     getPaymentInput,
     withDeliveryStatus,
+    calculateExtraMilkUpdate,
 };
